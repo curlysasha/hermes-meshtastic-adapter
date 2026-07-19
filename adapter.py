@@ -1622,6 +1622,37 @@ class MeshtasticAdapter(BasePlatformAdapter):
         else:
             status = AckStatus.ACK
 
+        # Diagnostic dump of the raw ACK packet. Lets us verify the real-vs-
+        # implicit verdict against what the radio actually saw: who sent it, how
+        # far away, signal, and whether it came via a relay / MQTT.
+        if isinstance(packet, dict):
+            hop_start = packet.get("hopStart")
+            hop_limit = packet.get("hopLimit")
+            hops_away = (
+                hop_start - hop_limit
+                if isinstance(hop_start, int) and isinstance(hop_limit, int)
+                else None
+            )
+            logger.info(
+                "Meshtastic ACK packet: req=%s verdict=%s from=%s (raw=%r) dest=%s (norm=%s) "
+                "to=%s hops=%s (start=%s limit=%s) snr=%s rssi=%s relay=%s mqtt=%s error=%s",
+                pkt_id,
+                status,
+                ack_from,
+                ack_from_raw,
+                dest,
+                dest_norm,
+                packet.get("toId") or packet.get("to"),
+                hops_away,
+                hop_start,
+                hop_limit,
+                packet.get("rxSnr"),
+                packet.get("rxRssi"),
+                packet.get("relayNode"),
+                packet.get("viaMqtt"),
+                error_reason,
+            )
+
         with self._ack_lock:
             record = self._pending_acks.get(pkt_id, {})
             prior = record.get("status")
