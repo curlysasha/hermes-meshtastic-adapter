@@ -958,17 +958,20 @@ class MeshtasticAdapter(BasePlatformAdapter):
             # allowed to talk to Hermes (e.g. a node the user just wants to watch).
             self._update_observed(from_id, packet.get("rxTime"), snr, rssi, hop_count)
 
-            # Restriction check BEFORE any further processing
-            if not self._is_authorized_node(from_id):
-                logger.warning(f"Unauthorized node ID {from_id} skipped.")
-                return
-
-            # echo filtering (avoid bot replying to itself)
+            # Echo filtering (avoid bot replying to itself) BEFORE the auth gate:
+            # our own node is normally NOT in the allowlist, so checking auth
+            # first would log every self-echo as "Unauthorized" (thousands of
+            # bogus warnings) and make this filter unreachable dead code.
             my_node_id = None
             if interface:
                 my_node_id = self._get_interface_node_id(interface)
 
             if my_node_id and from_id == my_node_id:
+                return
+
+            # Restriction check before any further processing
+            if not self._is_authorized_node(from_id):
+                logger.warning(f"Unauthorized node ID {from_id} skipped.")
                 return
 
             decoded = packet.get("decoded", {})
@@ -1673,6 +1676,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
                         "status": status,
                         "error_reason": error_reason,
                         "ack_from": ack_from,
+                        # Actual rebroadcaster hint (last byte of the relaying
+                        # node id). ack_from is the packet *originator* — for an
+                        # implicit ACK that is US, not a relay.
+                        "relay_node": (
+                            packet.get("relayNode") if isinstance(packet, dict) else None
+                        ),
                         "response_at": time.time(),
                         "response": {
                             "packet_id": (packet.get("id") if isinstance(packet, dict) else None),
@@ -1708,11 +1717,16 @@ class MeshtasticAdapter(BasePlatformAdapter):
         if applied_status == AckStatus.ACK and status == AckStatus.ACK:
             logger.info("Meshtastic ACK received (delivered): packet_id=%s dest=%s", pkt_id, dest)
         elif status == AckStatus.IMPLICIT_ACK and applied_status == AckStatus.IMPLICIT_ACK:
+            # NB: ack_from is the packet ORIGINATOR (our own node) — we heard our
+            # own packet rebroadcast. It is NOT the relay. The rebroadcaster hint
+            # is relayNode (last byte of its node id).
             logger.info(
-                "Meshtastic implicit ACK: packet_id=%s dest=%s relayed_by=%s (dest not confirmed)",
+                "Meshtastic implicit ACK: packet_id=%s dest=%s "
+                "(our packet was rebroadcast; dest did not confirm) origin=%s relay_node=%s",
                 pkt_id,
                 dest,
                 ack_from,
+                packet.get("relayNode") if isinstance(packet, dict) else None,
             )
         elif applied_status == AckStatus.NAK and status == AckStatus.NAK:
             logger.warning(
@@ -1940,7 +1954,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
                         message_id=pkt_id,
                         error=(
                             f"Meshtastic implicit ACK only for packet {pkt_id} "
-                            f"(relayed by {ack_record.get('ack_from')}; destination not confirmed)"
+                            f"(our packet was rebroadcast, relay_node="
+                            f"{ack_record.get('relay_node')}; destination did not confirm)"
                         ),
                         raw_response=raw_response,
                     )

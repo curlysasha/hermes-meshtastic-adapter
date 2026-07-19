@@ -303,6 +303,31 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
             self.adapter.handle_message.call_args[0][0].source.chat_id, "meshtastic:!ab12cd34"
         )
 
+    async def test_self_echo_skipped_before_auth_gate(self):
+        """Our own node's packets drop silently, not as "Unauthorized" warnings.
+
+        The local node is normally absent from the allowlist, so running the auth
+        gate first logged every self-echo as unauthorized (thousands of bogus
+        warnings) and left the echo filter unreachable.
+        """
+        iface = self.adapter.get_interfaces()[0]
+        own_id = iface.getMyNodeId()  # !da1b1613
+        # Production shape: the gateway's own node is NOT in the allowlist
+        # (the fixture allowlists it, which would hide the bug).
+        self.adapter.allowed_nodes = {"!ab12cd34"}
+        self.assertFalse(self.adapter._is_authorized_node(own_id))
+
+        packet = {
+            "fromId": own_id,
+            "toId": "!ab12cd34",
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "payload": b"echo of our own reply"},
+            "id": 6001,
+        }
+        with self.assertNoLogs("adapter", level="WARNING"):
+            self.adapter._on_receive(packet, iface)
+            await asyncio.sleep(0.05)
+        self.adapter.handle_message.assert_not_called()
+
     async def test_unauthorized_filter(self):
         """Verify unauthorized nodes are correctly filtered out."""
         # Packet from non-whitelisted node
