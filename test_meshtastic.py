@@ -328,6 +328,52 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
         self.adapter.handle_message.assert_not_called()
 
+    async def test_observability_recorded_for_unauthorized_nodes(self):
+        """Telemetry/position/signal are recorded for EVERY heard node.
+
+        The allowlist controls who may talk to the agent, not what the agent can
+        see of the mesh. Gating these writes left the DB holding data for the one
+        allowlisted node only, so the agent could report nothing current about
+        any other node.
+        """
+        stranger = "!bad55555"  # deliberately not allowlisted
+        self.assertFalse(self.adapter._is_authorized_node(stranger))
+        iface = self.adapter.get_interfaces()[0]
+
+        self.adapter._on_receive(
+            {
+                "fromId": stranger,
+                "toId": "^all",
+                "rxSnr": 5.5,
+                "rxRssi": -95,
+                "hopStart": 3,
+                "hopLimit": 2,
+                "decoded": {
+                    "portnum": "TELEMETRY_APP",
+                    "telemetry": {"deviceMetrics": {"batteryLevel": 77, "voltage": 4.01}},
+                },
+            },
+            iface,
+        )
+        self.adapter._on_receive(
+            {
+                "fromId": stranger,
+                "toId": "^all",
+                "decoded": {
+                    "portnum": "POSITION_APP",
+                    "position": {"latitude": 55.75, "longitude": 37.61, "altitude": 150},
+                },
+            },
+            iface,
+        )
+        await asyncio.sleep(0.15)
+
+        self.assertTrue(telemetry_db.get_telemetry_history(stranger, limit=1))
+        self.assertTrue(telemetry_db.get_position_history(stranger, limit=1))
+        self.assertTrue(telemetry_db.get_signal_history(stranger, limit=1))
+        # ...but its text still never reaches the agent.
+        self.adapter.handle_message.assert_not_called()
+
     async def test_unauthorized_filter(self):
         """Verify unauthorized nodes are correctly filtered out."""
         # Packet from non-whitelisted node

@@ -104,6 +104,23 @@ The outbound queue (`_outbound_queue`) is **in-memory only**, bounded at 100, ol
 
 `_standalone_send` (wired via `cron_deliver_env_var="MESHTASTIC_HOME_CHANNEL"`) spins up a **short-lived** adapter connection with `allow_queueing=False` so cron failures surface. It does not reuse the live gateway adapter.
 
+## Reference implementations — check these before guessing protocol semantics
+
+Meshtastic delivery/ACK behaviour is easy to get subtly wrong from the Python
+library alone (see the one-shot `onResponse` trap above). When in doubt, read
+the official sources rather than inferring. On this machine they're checked out
+at **`C:\GIT\MQTT\SOURCE CODE`** (plus a third-party reference, MeshRadar, at
+`C:\GIT\MQTT\MeshRadar` — useful but *not* authoritative).
+
+The parts that have already settled arguments here:
+
+- **Official Android client** — `Meshtastic-Android/core/data/src/commonMain/kotlin/org/meshtastic/core/data/manager/MeshDataHandlerImpl.kt`
+  - `handleAckNak()` — the canonical real-vs-implicit rule: `isAck && fromId == p.to` → `RECEIVED` (destination confirmed), `isAck` alone → `DELIVERED` (a relay confirmed), else `ERROR`. Also shows that a `RECEIVED` status is never downgraded, that multiple receipts per message are expected (`relays + 1`), and that the client does **no** app-level resend — a NAK just becomes `ERROR`.
+  - `PortNum.ROUTING_APP -> handleRouting` — receipts come from the general portnum dispatch, not a per-send callback.
+- **Firmware** — `firmware/src/mesh/NextHopRouter.cpp` / `ReliableRouter.cpp`, `firmware/src/mesh/NextHopRouter.h`
+  - `NUM_RELIABLE_RETX = 3` and the `sendAckNak(MAX_RETRANSMIT, ...)` call site: `wantAck=True` makes the firmware retransmit up to 3 times itself, then emit `MAX_RETRANSMIT` locally. So one app-level retry costs ~3 radio transmissions — budget retries accordingly.
+  - `mesh.pb.h` — the `Routing_Error` enum values behind `errorReason`.
+
 ## Conventions and gotchas
 
 - **`tools.py` is loaded as the module `meshtastic_tools`**, not `tools`, to avoid colliding with Hermes' own `tools` package. `adapter._load_tools_module` and `test_meshtastic.py` both do this dynamic load; preserve it.

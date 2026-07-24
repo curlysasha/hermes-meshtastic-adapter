@@ -997,15 +997,21 @@ class MeshtasticAdapter(BasePlatformAdapter):
             if my_node_id and from_id == my_node_id:
                 return
 
-            # Restriction check before any further processing
-            if not self._is_authorized_node(from_id):
-                logger.warning(f"Unauthorized node ID {from_id} skipped.")
-                return
-
             decoded = packet.get("decoded", {})
             portnum = decoded.get("portnum")
 
-            # Log signal qualities immediately if present
+            # Observability data (signal / telemetry / position) is recorded for
+            # EVERY heard node, BEFORE the auth gate — same rationale as
+            # _update_observed above. The allowlist exists to control who may
+            # *talk to the agent* (prompt-injection surface), not to blind the
+            # agent to the mesh around it. Gating these writes left the DB with
+            # data for the single allowlisted node only, so mesh_telemetry /
+            # mesh_signal_quality / position history were empty for every other
+            # node and the agent could only report stale library node-DB values.
+            #
+            # Safe to record pre-auth: these handlers persist numeric fields
+            # only (battery/voltage/temp/humidity/pressure/uptime, lat/lon/alt,
+            # snr/rssi/hops) — no attacker-controlled text reaches the agent.
             if snr is not None or rssi is not None:
                 self._run_db_write(lambda: telemetry_db.log_signal(from_id, snr, rssi, hop_count))
 
@@ -1023,6 +1029,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
             # We only bridge TEXT messages (TEXT_MESSAGE_APP == 1)
             if portnum not in ("TEXT_MESSAGE_APP", 1, "TEXT_MESSAGE"):
+                return
+
+            # Restriction check — guards the message path into the agent, which
+            # is the only path carrying attacker-controlled text.
+            if not self._is_authorized_node(from_id):
+                logger.warning(f"Unauthorized node ID {from_id} skipped.")
                 return
 
             # Library may expose decoded text and/or raw payload bytes.
