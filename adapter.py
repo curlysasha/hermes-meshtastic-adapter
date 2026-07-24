@@ -343,6 +343,11 @@ class MeshtasticAdapter(BasePlatformAdapter):
         self._pending_acks: dict[str, dict[str, Any]] = {}
         self._ack_responses: dict[str, dict[str, Any]] = {}
         self._ack_futures: dict[str, asyncio.Future] = {}
+        # Routing packets reach us twice — once via the library's one-shot
+        # onResponse handler and once via the pubsub receive path (we watch
+        # ROUTING_APP there so late/relayed ACKs aren't lost). Dedupe by the
+        # routing packet's own id so a single physical packet is counted once.
+        self._seen_routing_packets: dict[str, float] = {}
         self._ack_lock = threading.Lock()
 
         # Loop bridge helpers
@@ -958,6 +963,29 @@ class MeshtasticAdapter(BasePlatformAdapter):
             # allowed to talk to Hermes (e.g. a node the user just wants to watch).
             self._update_observed(from_id, packet.get("rxTime"), snr, rssi, hop_count)
 
+            # Delivery receipts (ROUTING_APP) are handled here, BEFORE the
+            # self-echo and auth gates, exactly like the official client's
+            # general portnum dispatch (MeshDataHandlerImpl: PortNum.ROUTING_APP
+            # -> handleRouting). This matters because the meshtastic library's
+            # per-send onResponse handler is ONE-SHOT — it is popped on the first
+            # routing response, so an early *implicit* ACK consumed it and the
+            # destination's later real ACK was never seen (on a relayed path a
+            # real ACK was therefore impossible to observe). Watching the pubsub
+            # stream catches every routing packet for the request; the dedupe in
+            # _record_ack_response keeps the first one from counting twice.
+            #
+            # These are protocol receipts, not user content, so the allowlist
+            # (which exists to gate who may talk to the agent) must not drop
+            # them — otherwise an ACK from a node we message but don't allowlist
+            # would be discarded.
+            decoded_early = packet.get("decoded", {}) or {}
+            if decoded_early.get("portnum") in ("ROUTING_APP", 5):
+                ack_dest = self._ack_dest_for(packet)
+                # Unknown request id → a receipt for something we didn't send.
+                if ack_dest is not None:
+                    self._record_ack_response(packet, ack_dest, "")
+                return
+
             # Echo filtering (avoid bot replying to itself) BEFORE the auth gate:
             # our own node is normally NOT in the allowlist, so checking auth
             # first would log every self-echo as "Unauthorized" (thousands of
@@ -1417,17 +1445,30 @@ class MeshtasticAdapter(BasePlatformAdapter):
     def _is_retriable_failure(self, result: SendResult) -> bool:
         """Decide whether a failed chunk send is worth re-sending.
 
-        Only ACK-observed failures qualify: a timeout, an implicit (relay-only)
-        ACK, or a NAK whose reason is not permanent. Pre-send errors (no
-        interface, missing pubkey, bad chat_id) carry no ACK record and are
-        never retried — re-sending can't fix them.
+        Retry only on **evidence of non-delivery** — so the agent gets another
+        shot at reaching the user without spamming the mesh with copies:
+
+        * ``TIMEOUT`` — nothing came back at all, no sign the packet even
+          entered the mesh.
+        * ``NAK`` with a non-permanent reason (e.g. ``MAX_RETRANSMIT``, the
+          firmware's own "reliable send failed" verdict after its
+          ``NUM_RELIABLE_RETX`` attempts).
+
+        An ``IMPLICIT_ACK`` is deliberately **not** retried. It means the mesh
+        carried the packet (a node rebroadcast it), so non-delivery is not
+        established — and now that ROUTING_APP receipts are watched on the
+        pubsub path, the destination's real ACK can still arrive and upgrade the
+        record. Retrying here is what re-sent the same reply up to a dozen times
+        on a relayed path, since every copy actually reached the user.
+
+        Pre-send errors (no interface, missing pubkey, bad chat_id) carry no ACK
+        record and are never retried — re-sending can't fix them.
         """
         ack = (result.raw_response or {}).get("ack")
         if not isinstance(ack, dict):
             return False
         status = ack.get("status")
-        # No confirmation, or only a relay confirmed — both warrant a retry.
-        if status in (AckStatus.TIMEOUT, AckStatus.IMPLICIT_ACK):
+        if status == AckStatus.TIMEOUT:
             return True
         if status == AckStatus.NAK:
             reason = str(ack.get("error_reason") or "").upper()
@@ -1604,6 +1645,26 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         return onAckNak
 
+    def _ack_dest_for(self, packet: dict) -> str | None:
+        """Resolve the destination of the send this routing receipt answers.
+
+        The pubsub ROUTING_APP path has no closure to carry ``dest`` (unlike the
+        onResponse callback), so recover it from the pending-ACK bookkeeping via
+        the receipt's ``requestId``. Returns ``None`` when the request id isn't
+        one of ours — then the receipt must be ignored rather than recorded.
+        """
+        decoded = packet.get("decoded", {}) if isinstance(packet, dict) else {}
+        request_id = decoded.get("requestId") or decoded.get("request_id")
+        if request_id is None:
+            return None
+        pkt_id = str(request_id)
+        with self._ack_lock:
+            record = self._pending_acks.get(pkt_id) or self._ack_responses.get(pkt_id)
+            if not isinstance(record, dict):
+                return None
+            dest = record.get("dest")
+        return dest if isinstance(dest, str) else None
+
     def _record_ack_response(self, packet: dict, dest: str, content: str) -> None:
         """Log and store Meshtastic ACK/NACK responses without blocking send().
 
@@ -1622,6 +1683,24 @@ class MeshtasticAdapter(BasePlatformAdapter):
         routing = decoded.get("routing", {}) or {}
         request_id = decoded.get("requestId") or decoded.get("request_id")
         error_reason = routing.get("errorReason") or routing.get("error_reason")
+
+        # The same physical routing packet arrives twice: via the library's
+        # one-shot onResponse handler and via the pubsub ROUTING_APP path.
+        # Count it once, keyed on the routing packet's own id.
+        routing_pkt_id = packet.get("id") if isinstance(packet, dict) else None
+        if routing_pkt_id is not None:
+            key = str(routing_pkt_id)
+            with self._ack_lock:
+                if key in self._seen_routing_packets:
+                    return
+                self._seen_routing_packets[key] = time.time()
+                if len(self._seen_routing_packets) > self.ACK_RECORD_LIMIT:
+                    # Bounded, oldest-first eviction.
+                    for stale in sorted(
+                        self._seen_routing_packets,
+                        key=lambda k: self._seen_routing_packets[k],
+                    )[: len(self._seen_routing_packets) - self.ACK_RECORD_LIMIT]:
+                        self._seen_routing_packets.pop(stale, None)
         pkt_id = str(request_id) if request_id is not None else "unknown"
 
         # Who sent this ACK. Applied to DMs only (dest is a "!node" id).
