@@ -42,15 +42,27 @@ try:
     import meshtastic
     import meshtastic.serial_interface
     import meshtastic.tcp_interface
+    from meshtastic.protobuf import mesh_pb2, portnums_pb2, telemetry_pb2
     from pubsub import pub
 
     HAS_MESHTASTIC = True
 except ImportError:
     HAS_MESHTASTIC = False
     pub = None
+    # cast keeps the protobuf fallbacks usable as module stand-ins for the type
+    # checker; every access to them is guarded by HAS_MESHTASTIC at runtime.
+    mesh_pb2 = portnums_pb2 = telemetry_pb2 = cast(Any, None)
 
 # Default Meshtastic TCP API port exposed by WiFi/Ethernet-capable nodes.
 DEFAULT_TCP_PORT = 4403
+
+
+class MeshLinkLost(RuntimeError):
+    """The radio link dropped while a solicited request was in flight.
+
+    Distinct from a timeout: the node never got the chance to answer, so the
+    agent should report a link failure rather than a silent node.
+    """
 
 
 class AckStatus(StrEnum):
@@ -140,6 +152,7 @@ class MockSerialInterface:
         }
         self.localNode = MockLocalNode(self)
         self.metadata = {"firmwareVersion": "2.3.15"}
+        self.sent_data: list[dict] = []
         logger.info(f"Initialized Mock Serial Connection on {self.devPath}")
 
     def getMyNodeId(self):
@@ -151,14 +164,54 @@ class MockSerialInterface:
         )
         return SimpleNamespace(id=int(time.time() * 1000) & 0xFFFFFFFF)
 
+    def getMyNodeInfo(self):
+        return self.nodes["!da1b1613"]
+
+    def sendData(
+        self,
+        data,
+        destinationId=None,
+        portNum=None,
+        wantResponse=False,
+        onResponse=None,
+        hopLimit=None,
+        **kwargs,
+    ):
+        logger.info(
+            f"[Mock] Sent data to {destinationId} (portNum={portNum}, "
+            f"wantResponse={wantResponse}, hopLimit={hopLimit})"
+        )
+        self.sent_data.append(
+            {
+                "payload": data,
+                "destinationId": destinationId,
+                "portNum": portNum,
+                "wantResponse": wantResponse,
+                "hopLimit": hopLimit,
+            }
+        )
+        return SimpleNamespace(id=int(time.time() * 1000) & 0xFFFFFFFF)
+
+    # The library's sendTelemetry/sendPosition/sendTraceRoute helpers BLOCK the
+    # calling thread on a waitForX() busy-wait (up to the interface Timeout —
+    # 300s on TCP) whenever wantResponse=True, which is why solicited requests
+    # must go out through sendData instead. The mock refuses them outright so a
+    # regression fails loudly here instead of stalling a live tool call for
+    # five minutes. See MeshtasticAdapter._post_request.
+    def _blocking_helper(self, name):
+        raise AssertionError(
+            f"{name}() blocks on the library's waitForX() when wantResponse=True — "
+            "use sendData() so our own timeout governs the wait"
+        )
+
     def sendTelemetry(self, destinationId=None, wantResponse=False, **kwargs):
-        logger.info(f"[Mock] Telemetry request to {destinationId} (wantResponse={wantResponse})")
+        self._blocking_helper("sendTelemetry")
 
     def sendPosition(self, destinationId=None, wantResponse=False, **kwargs):
-        logger.info(f"[Mock] Position request to {destinationId} (wantResponse={wantResponse})")
+        self._blocking_helper("sendPosition")
 
     def sendTraceRoute(self, dest, hopLimit, **kwargs):
-        logger.info(f"[Mock] Traceroute to {dest} (hopLimit={hopLimit})")
+        self._blocking_helper("sendTraceRoute")
 
     def close(self):
         logger.info("[Mock] Closed connection")
@@ -895,11 +948,13 @@ class MeshtasticAdapter(BasePlatformAdapter):
 
         The library fires ``meshtastic.connection.lost`` from ``_disconnected()``
         — e.g. on a reader-thread exit or a device reboot — cases the liveness
-        poll can miss or lag. This is observability-only; the reconnect loop's
-        ``_interface_is_alive`` poll still owns teardown to avoid racing the
-        library's own TCP self-heal.
+        poll can miss or lag. Teardown still belongs to the reconnect loop's
+        ``_interface_is_alive`` poll, to avoid racing the library's own TCP
+        self-heal; the only state we settle here is the solicited-request
+        waiters, whose replies can no longer arrive.
         """
         logger.warning("Meshtastic reported connection lost (interface=%s).", interface)
+        self._abandon_response_waiters("connection lost")
 
     def _on_connection_established(self, interface=None):
         """Log Meshtastic-reported connection establishment (pubsub background thread)."""
@@ -1720,6 +1775,36 @@ class MeshtasticAdapter(BasePlatformAdapter):
             if fut_loop is not None and fut_loop.is_running():
                 fut_loop.call_soon_threadsafe(self._set_ack_future_result, future, payload)
 
+    def _abandon_response_waiters(self, reason: str) -> None:
+        """Fail every in-flight solicited request when the link goes down.
+
+        A reply can only reach us over the connection the request went out on,
+        so once that connection dies the wait is pure dead time — up to a full
+        60s traceroute timeout during which the agent sits mute. Waking the
+        waiters immediately turns a hang into an answer the agent can act on
+        (and retry), which matters on a node that drops TCP as a matter of
+        routine.
+        """
+        with self._response_lock:
+            pending = [f for futures in self._response_waiters.values() for f in futures]
+            self._response_waiters.clear()
+        if not pending:
+            return
+        logger.info("Abandoning %d in-flight Meshtastic request(s): %s", len(pending), reason)
+        for future in pending:
+            if future.done():
+                continue
+            fut_loop = future.get_loop()
+            if fut_loop is not None and fut_loop.is_running():
+                fut_loop.call_soon_threadsafe(
+                    self._set_future_exception, future, MeshLinkLost(reason)
+                )
+
+    @staticmethod
+    def _set_future_exception(future: asyncio.Future, exc: BaseException) -> None:
+        if not future.done():
+            future.set_exception(exc)
+
     def _discard_response_waiter(self, kind: str, node_id: str, future: asyncio.Future) -> None:
         """Drop a waiter that timed out so the registry can't grow unbounded."""
         with self._response_lock:
@@ -1745,6 +1830,8 @@ class MeshtasticAdapter(BasePlatformAdapter):
         since silence is the normal outcome for a distant node.
         """
         dest = self._normalize_node_id(node_id) or node_id
+        if not HAS_MESHTASTIC:
+            return {"ok": False, "error": "The meshtastic library is not installed"}
         ifaces = self.get_interfaces()
         if not ifaces:
             return {"ok": False, "error": "No active Meshtastic interfaces connected"}
@@ -1772,15 +1859,91 @@ class MeshtasticAdapter(BasePlatformAdapter):
                     "The node may be out of range, asleep, or the reply was lost."
                 ),
             }
+        except MeshLinkLost as e:
+            self._discard_response_waiter(kind, dest, future)
+            logger.info("Meshtastic %s request to %s abandoned: %s", kind, dest, e)
+            return {
+                "ok": False,
+                "error": (
+                    f"The radio link dropped while waiting for {dest} to answer the "
+                    f"{kind} request ({e}), so the reply could never arrive. "
+                    "Retry once the radio is back."
+                ),
+            }
         logger.info("Meshtastic %s reply received from %s", kind, dest)
         return {"ok": True, "data": data}
+
+    def _post_request(
+        self,
+        iface: Any,
+        dest: str,
+        payload: Any,
+        portnum: Any,
+        hop_limit: int | None = None,
+    ) -> None:
+        """Transmit a ``want_response`` packet WITHOUT the library's blocking wait.
+
+        ``sendPosition``/``sendTelemetry``/``sendTraceRoute`` each call their own
+        ``waitForX()`` helper when ``wantResponse=True``. Those helpers busy-wait
+        on the interface's ``Timeout`` — 300s for a TCP interface — inside our
+        executor thread, and raise ``MeshInterfaceError`` on expiry. That made a
+        silent (or unreachable) node stall the whole tool call for five minutes
+        and surface as "failed to send", while our own ``timeout`` never applied:
+        execution never reached the ``asyncio.wait_for`` below it.
+
+        We already resolve replies ourselves on the pubsub receive path
+        (``_resolve_response_waiters``), so the packet goes out via ``sendData``
+        — which only serializes and posts it — and ``_solicit``'s timeout is the
+        single authority on how long we wait. ``onResponse`` stays ``None`` for
+        the same reason: the library's response handler would be redundant.
+        """
+        iface.sendData(
+            payload,
+            destinationId=dest,
+            portNum=portnum,
+            wantResponse=True,
+            onResponse=None,
+            hopLimit=hop_limit,
+        )
+
+    @staticmethod
+    def _telemetry_request(iface: Any) -> Any:
+        """Build the telemetry request packet the official client sends.
+
+        Firmware answers any ``want_response`` telemetry packet whatever its
+        payload, but the stock client fills the request with its OWN device
+        metrics so the peer hears our battery state in the exchange. Mirroring
+        that keeps us a well-behaved citizen on the mesh rather than a bare
+        poller — and an unpopulated node DB just means we send an empty one.
+        """
+        request = telemetry_pb2.Telemetry()
+        try:
+            metrics = (iface.getMyNodeInfo() or {}).get("deviceMetrics") or {}
+        except Exception:
+            metrics = {}
+        for field, key in (
+            ("battery_level", "batteryLevel"),
+            ("voltage", "voltage"),
+            ("channel_utilization", "channelUtilization"),
+            ("air_util_tx", "airUtilTx"),
+            ("uptime_seconds", "uptimeSeconds"),
+        ):
+            value = metrics.get(key)
+            if value is not None:
+                setattr(request.device_metrics, field, value)
+        return request
 
     async def request_telemetry(self, node_id: str, timeout: float = 45.0) -> dict[str, Any]:
         """Ask a node for fresh device metrics (battery, voltage, uptime)."""
         return await self._solicit(
             "telemetry",
             node_id,
-            lambda iface, dest: iface.sendTelemetry(destinationId=dest, wantResponse=True),
+            lambda iface, dest: self._post_request(
+                iface,
+                dest,
+                self._telemetry_request(iface),
+                portnums_pb2.PortNum.TELEMETRY_APP,
+            ),
             timeout,
         )
 
@@ -1789,7 +1952,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
         return await self._solicit(
             "position",
             node_id,
-            lambda iface, dest: iface.sendPosition(destinationId=dest, wantResponse=True),
+            # An empty Position is what the stock client sends when it asks for
+            # someone else's fix — every field is optional, and we are asking,
+            # not reporting. (sendPosition(0, 0, 0) serializes to the same.)
+            lambda iface, dest: self._post_request(
+                iface, dest, mesh_pb2.Position(), portnums_pb2.PortNum.POSITION_APP
+            ),
             timeout,
         )
 
@@ -1800,7 +1968,15 @@ class MeshtasticAdapter(BasePlatformAdapter):
         return await self._solicit(
             "traceroute",
             node_id,
-            lambda iface, dest: iface.sendTraceRoute(dest, hop_limit),
+            # RouteDiscovery goes out empty — each relay appends itself on the
+            # way, and the reply carries the assembled route.
+            lambda iface, dest: self._post_request(
+                iface,
+                dest,
+                mesh_pb2.RouteDiscovery(),
+                portnums_pb2.PortNum.TRACEROUTE_APP,
+                hop_limit=hop_limit,
+            ),
             timeout,
         )
 

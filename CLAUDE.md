@@ -96,9 +96,13 @@ Any new packet-handling work must respect this boundary — do not touch loop st
 
 ### Solicited requests (agent asks a node for data)
 
-`mesh_request_telemetry`, `mesh_request_position` and `mesh_traceroute` are the only tools that **transmit**; everything else serves data already heard. They map to the library's `sendTelemetry(wantResponse=True)` / `sendPosition(wantResponse=True)` / `sendTraceRoute`.
+`mesh_request_telemetry`, `mesh_request_position` and `mesh_traceroute` are the only tools that **transmit**; everything else serves data already heard.
 
 `_solicit()` is the shared path: arm a waiter via `_register_response_waiter(kind, node_id)`, send through `run_in_executor`, then `asyncio.wait_for`. `_on_receive` resolves waiters when the matching `TELEMETRY_APP` / `POSITION_APP` / `TRACEROUTE_APP` packet arrives. Waiter futures follow the same cross-loop discipline as ACK futures — created on the awaiting loop, resolved via `future.get_loop().call_soon_threadsafe` — because a tool call can run on a different loop than `connect()` did. A timeout drops the waiter (`_discard_response_waiter`) so the registry can't leak.
+
+**Never send these through `sendTelemetry` / `sendPosition` / `sendTraceRoute`.** With `wantResponse=True` each of those library helpers calls its own `waitForX()` after posting the packet — a busy-wait on the interface `Timeout` (**300s** on TCP) that blocks the executor thread and raises `MeshInterfaceError` on expiry. That both bypasses our `timeout` entirely (execution never reaches `asyncio.wait_for`) and misreports the result as a send failure. A silent node cost one live tool call five minutes this way. Requests go out through `_post_request()` → `sendData(..., wantResponse=True, onResponse=None)`, which only serializes and posts; we already track the reply ourselves, so `onResponse` would be redundant. `MockSerialInterface` raises `AssertionError` if the blocking helpers are called, so a regression fails in tests instead of on the air.
+
+**A dropped link abandons in-flight requests.** `_on_connection_lost` calls `_abandon_response_waiters()`, failing every pending waiter with `MeshLinkLost`, which `_solicit` reports as a link failure distinct from a silent node. Without it the agent would sit out the full 45–60s timeout waiting for a reply that can no longer arrive over a dead socket — routine on a node that drops TCP under load.
 
 **Airtime discipline is a design constraint, not a detail.** LoRa bandwidth is shared with everyone in range, so each request is addressed to exactly ONE node, is **never retried**, and a silent node returns `answered: false` rather than raising. The schemas say so explicitly to steer the model away from mesh-wide sweeps. Traceroute is the tool of choice for diagnosing delivery: it reports the real relay chain and per-hop SNR in both directions (SNR arrives scaled by 4), which is what distinguishes a weak-direct path from a healthy relayed one.
 

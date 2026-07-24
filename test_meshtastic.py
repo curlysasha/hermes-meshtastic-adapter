@@ -2097,3 +2097,55 @@ class TestMeshtasticSolicitedRequests(unittest.IsolatedAsyncioTestCase):
         meshtastic_tools.set_adapter(None)
         out = json.loads(await handle_mesh_traceroute({"node_id": "!ab12cd34"}))
         self.assertIn("error", out)
+
+    async def test_requests_never_use_the_blocking_library_helpers(self):
+        """Requests go out via sendData — the sendX helpers busy-wait for 300s.
+
+        ``sendTelemetry``/``sendPosition``/``sendTraceRoute`` call ``waitForX()``
+        internally when ``wantResponse=True``, stalling the executor thread on
+        the library's own Timeout and bypassing ours entirely. The mock raises
+        if they are used; here we also pin the packets we do put on the air.
+        """
+        iface = self.adapter.get_interfaces()[0]
+
+        # Straight at the adapter: the tool layer clamps timeouts to >= 5s, and
+        # what is under test here is the packet we put on the air.
+        await self.adapter.request_telemetry("!ab12cd34", timeout=0.2)
+        await self.adapter.request_position("!ab12cd34", timeout=0.2)
+        await self.adapter.request_traceroute("!ab12cd34", hop_limit=3, timeout=0.2)
+
+        sent = iface.sent_data
+        self.assertEqual([p["portNum"] for p in sent], [67, 3, 70])  # telemetry, position, trace
+        self.assertTrue(all(p["wantResponse"] for p in sent))
+        self.assertTrue(all(p["destinationId"] == "!ab12cd34" for p in sent))
+        self.assertEqual(sent[2]["hopLimit"], 3)  # traceroute honours hop_limit
+        # The telemetry request carries our own metrics, like the stock client.
+        self.assertEqual(sent[0]["payload"].device_metrics.battery_level, 85)
+
+    async def test_own_timeout_governs_the_wait_not_the_library(self):
+        """A silent node returns after OUR timeout, not the library's 300s."""
+        started = time.monotonic()
+        out = await self.adapter.request_position("!ab12cd34", timeout=0.3)
+        self.assertFalse(out["ok"])
+        self.assertIn("did not answer", out["error"])
+        self.assertLess(time.monotonic() - started, 3.0)
+
+    async def test_dropped_link_abandons_the_wait_immediately(self):
+        """A connection drop fails in-flight requests instead of waiting them out."""
+
+        async def drop_link_soon():
+            await asyncio.sleep(0.05)
+            self.adapter._on_connection_lost(self.adapter.get_interfaces()[0])
+
+        started = time.monotonic()
+        task = asyncio.create_task(drop_link_soon())
+        out = json.loads(
+            # A timeout long enough that waiting it out would be obvious.
+            await handle_mesh_request_position({"node_id": "!ab12cd34", "timeout": 30})
+        )
+        await task
+
+        self.assertFalse(out["answered"])
+        self.assertIn("radio link dropped", out["error"])
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertFalse(self.adapter._response_waiters)  # no leak on the abandon path
