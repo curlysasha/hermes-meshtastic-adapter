@@ -59,6 +59,9 @@ handle_mesh_send_dm = meshtastic_tools.handle_mesh_send_dm
 handle_mesh_send_broadcast = meshtastic_tools.handle_mesh_send_broadcast
 handle_mesh_telemetry = meshtastic_tools.handle_mesh_telemetry
 handle_mesh_telemetry_history = meshtastic_tools.handle_mesh_telemetry_history
+handle_mesh_request_telemetry = meshtastic_tools.handle_mesh_request_telemetry
+handle_mesh_request_position = meshtastic_tools.handle_mesh_request_position
+handle_mesh_traceroute = meshtastic_tools.handle_mesh_traceroute
 
 
 class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
@@ -1971,3 +1974,126 @@ class TestMeshtasticTcpTransport(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMeshtasticSolicitedRequests(unittest.IsolatedAsyncioTestCase):
+    """Active over-the-air requests: telemetry, position, traceroute."""
+
+    async def asyncSetUp(self):
+        self._env_patcher = patch.dict(
+            os.environ,
+            {
+                "MESHTASTIC_SERIAL_PORT": "",
+                "MESHTASTIC_ALLOWED_NODES": "",
+                "MESHTASTIC_CHUNK_DELAY": "0",
+            },
+        )
+        self._env_patcher.start()
+        self._tmp_db = tempfile.NamedTemporaryFile(delete=False)
+        self._tmp_db.close()
+        telemetry_db.DB_PATH = self._tmp_db.name
+        init_db()
+
+        self.config = MagicMock()
+        self.config.extra = {
+            "serial_port": "mock_port",
+            "allowed_users": "!ab12cd34,!da1b1613",
+            "allow_all_users": False,
+        }
+        self.adapter = MeshtasticAdapter(self.config)
+        self.adapter.handle_message = AsyncMock()
+        await self.adapter.connect()
+        await asyncio.sleep(0.1)
+        meshtastic_tools.set_adapter(self.adapter)
+
+    async def asyncTearDown(self):
+        meshtastic_tools.set_adapter(None)
+        await self.adapter.disconnect()
+        self._env_patcher.stop()
+        try:
+            os.unlink(self._tmp_db.name)
+        except Exception:
+            pass  # a background DB write may still hold the file on Windows
+
+    def _reply_after_send(self, packet: dict, delay: float = 0.05):
+        """Feed *packet* into the receive path shortly after the request goes out."""
+        loop = asyncio.get_running_loop()
+        loop.call_later(
+            delay,
+            lambda: self.adapter._on_receive(packet, self.adapter.get_interfaces()[0]),
+        )
+
+    async def test_request_telemetry_returns_fresh_metrics(self):
+        """A solicited telemetry reply resolves the waiter and is reported."""
+        self._reply_after_send(
+            {
+                "fromId": "!ab12cd34",
+                "decoded": {
+                    "portnum": "TELEMETRY_APP",
+                    "telemetry": {"deviceMetrics": {"batteryLevel": 64, "voltage": 3.91}},
+                },
+            }
+        )
+        out = json.loads(
+            await handle_mesh_request_telemetry({"node_id": "!ab12cd34", "timeout": 5})
+        )
+        self.assertTrue(out["answered"])
+        self.assertEqual(out["battery_level"], 64)
+        self.assertEqual(out["voltage"], 3.91)
+
+    async def test_request_position_scales_protobuf_coordinates(self):
+        """Coordinates arrive scaled by 1e7 and must be converted back."""
+        self._reply_after_send(
+            {
+                "fromId": "!ab12cd34",
+                "decoded": {
+                    "portnum": "POSITION_APP",
+                    "position": {
+                        "latitude": 551885155,
+                        "longitude": 613386332,
+                        "altitude": 210,
+                    },
+                },
+            }
+        )
+        out = json.loads(await handle_mesh_request_position({"node_id": "!ab12cd34", "timeout": 5}))
+        self.assertTrue(out["answered"])
+        self.assertAlmostEqual(out["latitude"], 55.1885155, places=5)
+        self.assertAlmostEqual(out["longitude"], 61.3386332, places=5)
+
+    async def test_traceroute_reports_route_and_per_hop_snr(self):
+        """The route is mapped to node ids and SNR is unscaled (sent x4)."""
+        self._reply_after_send(
+            {
+                "fromId": "!ab12cd34",
+                "decoded": {
+                    "portnum": "TRACEROUTE_APP",
+                    "traceroute": {
+                        "route": [0x9E77EDEC],
+                        "snrTowards": [24, -18],  # 6.0 dB, -4.5 dB
+                        "routeBack": [],
+                        "snrBack": [],
+                    },
+                },
+            }
+        )
+        out = json.loads(await handle_mesh_traceroute({"node_id": "!ab12cd34", "timeout": 5}))
+        self.assertTrue(out["answered"])
+        self.assertEqual(out["route_towards"][0]["node_id"], "!9e77edec")
+        self.assertAlmostEqual(out["route_towards"][0]["snr"], 6.0)
+
+    async def test_silent_node_times_out_without_raising(self):
+        """No reply is a normal outcome — report it, don't raise or retry."""
+        out = json.loads(
+            await handle_mesh_request_telemetry({"node_id": "!ab12cd34", "timeout": 5})
+        )
+        self.assertFalse(out["answered"])
+        self.assertIn("did not answer", out["error"])
+        # The waiter must not leak after the timeout.
+        self.assertFalse(self.adapter._response_waiters)
+
+    async def test_request_without_adapter_reports_error(self):
+        """Tools degrade gracefully when no adapter is active."""
+        meshtastic_tools.set_adapter(None)
+        out = json.loads(await handle_mesh_traceroute({"node_id": "!ab12cd34"}))
+        self.assertIn("error", out)

@@ -151,6 +151,15 @@ class MockSerialInterface:
         )
         return SimpleNamespace(id=int(time.time() * 1000) & 0xFFFFFFFF)
 
+    def sendTelemetry(self, destinationId=None, wantResponse=False, **kwargs):
+        logger.info(f"[Mock] Telemetry request to {destinationId} (wantResponse={wantResponse})")
+
+    def sendPosition(self, destinationId=None, wantResponse=False, **kwargs):
+        logger.info(f"[Mock] Position request to {destinationId} (wantResponse={wantResponse})")
+
+    def sendTraceRoute(self, dest, hopLimit, **kwargs):
+        logger.info(f"[Mock] Traceroute to {dest} (hopLimit={hopLimit})")
+
     def close(self):
         logger.info("[Mock] Closed connection")
 
@@ -349,6 +358,12 @@ class MeshtasticAdapter(BasePlatformAdapter):
         # routing packet's own id so a single physical packet is counted once.
         self._seen_routing_packets: dict[str, float] = {}
         self._ack_lock = threading.Lock()
+
+        # Waiters for *solicited* replies (telemetry / position / traceroute
+        # requested with wantResponse). Keyed (kind, node_id) -> futures, which
+        # _on_receive resolves when the matching packet arrives.
+        self._response_waiters: dict[tuple[str, str], list[asyncio.Future]] = {}
+        self._response_lock = threading.Lock()
 
         # Loop bridge helpers
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -1020,11 +1035,26 @@ class MeshtasticAdapter(BasePlatformAdapter):
             # telemetry/env — those are NODEINFO_APP and IP_TUNNEL_APP.
             if portnum in ("TELEMETRY_APP", 67):
                 self._run_db_write(lambda: self._handle_telemetry_packet(from_id, decoded))
+                self._resolve_response_waiters(
+                    "telemetry", from_id, decoded.get("telemetry", decoded)
+                )
                 return
 
             # Position: portnums_pb2.PortNum.POSITION_APP == 3
             if portnum in ("POSITION_APP", 3):
                 self._run_db_write(lambda: self._handle_position_packet(from_id, decoded))
+                self._resolve_response_waiters(
+                    "position", from_id, decoded.get("position", decoded)
+                )
+                return
+
+            # Traceroute reply: portnums_pb2.PortNum.TRACEROUTE_APP == 70. Carries
+            # the discovered route (node numbers) and per-hop SNR in both
+            # directions — the only way to see which relays actually carry our
+            # traffic. Numeric payload, so handled pre-auth like the rest.
+            if portnum in ("TRACEROUTE_APP", 70):
+                route = decoded.get("traceroute") or decoded.get("routeDiscovery") or {}
+                self._resolve_response_waiters("traceroute", from_id, route)
                 return
 
             # We only bridge TEXT messages (TEXT_MESSAGE_APP == 1)
@@ -1656,6 +1686,123 @@ class MeshtasticAdapter(BasePlatformAdapter):
             self._record_ack_response(packet, dest, content)
 
         return onAckNak
+
+    # ------------------------------------------------------------------
+    # Solicited requests (agent actively asks a node for data)
+    #
+    # These put packets on the air, unlike the read-only tools that serve
+    # already-heard data. LoRa airtime is a shared, scarce resource, so each
+    # request is addressed to ONE node and never retried — a silent node just
+    # reports "no response".
+    # ------------------------------------------------------------------
+
+    def _register_response_waiter(self, kind: str, node_id: str) -> asyncio.Future:
+        """Arm a waiter for a solicited reply of *kind* from *node_id*.
+
+        The future is bound to the loop that awaits it (the caller's), and
+        resolved from the receive path via ``future.get_loop()`` — the same
+        cross-loop discipline the ACK futures use.
+        """
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        with self._response_lock:
+            self._response_waiters.setdefault((kind, node_id), []).append(future)
+        return future
+
+    def _resolve_response_waiters(self, kind: str, node_id: str, payload: dict) -> None:
+        """Hand *payload* to anyone waiting on a *kind* reply from *node_id*."""
+        with self._response_lock:
+            futures = self._response_waiters.pop((kind, node_id), [])
+        for future in futures:
+            if future.done():
+                continue
+            fut_loop = future.get_loop()
+            if fut_loop is not None and fut_loop.is_running():
+                fut_loop.call_soon_threadsafe(self._set_ack_future_result, future, payload)
+
+    def _discard_response_waiter(self, kind: str, node_id: str, future: asyncio.Future) -> None:
+        """Drop a waiter that timed out so the registry can't grow unbounded."""
+        with self._response_lock:
+            pending = self._response_waiters.get((kind, node_id))
+            if not pending:
+                return
+            if future in pending:
+                pending.remove(future)
+            if not pending:
+                self._response_waiters.pop((kind, node_id), None)
+
+    async def _solicit(
+        self,
+        kind: str,
+        node_id: str,
+        send: Callable[[Any, str], Any],
+        timeout: float,
+    ) -> dict[str, Any]:
+        """Send a request to one node and await its reply.
+
+        Returns ``{"ok": True, "data": ...}``, or ``{"ok": False, "error": ...}``
+        when the node stays silent — never raises for an unanswered request,
+        since silence is the normal outcome for a distant node.
+        """
+        dest = self._normalize_node_id(node_id) or node_id
+        ifaces = self.get_interfaces()
+        if not ifaces:
+            return {"ok": False, "error": "No active Meshtastic interfaces connected"}
+        iface = ifaces[0]
+
+        future = self._register_response_waiter(kind, dest)
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, lambda: send(iface, dest))
+        except Exception as e:
+            self._discard_response_waiter(kind, dest, future)
+            logger.error("Meshtastic %s request to %s failed to send: %s", kind, dest, e)
+            return {"ok": False, "error": f"Could not send {kind} request: {e}"}
+
+        logger.info("Meshtastic %s requested from %s (timeout=%.0fs)", kind, dest, timeout)
+        try:
+            data = await asyncio.wait_for(future, timeout=timeout)
+        except TimeoutError:
+            self._discard_response_waiter(kind, dest, future)
+            logger.info("Meshtastic %s request to %s timed out", kind, dest)
+            return {
+                "ok": False,
+                "error": (
+                    f"{dest} did not answer the {kind} request within {timeout:.0f}s. "
+                    "The node may be out of range, asleep, or the reply was lost."
+                ),
+            }
+        logger.info("Meshtastic %s reply received from %s", kind, dest)
+        return {"ok": True, "data": data}
+
+    async def request_telemetry(self, node_id: str, timeout: float = 45.0) -> dict[str, Any]:
+        """Ask a node for fresh device metrics (battery, voltage, uptime)."""
+        return await self._solicit(
+            "telemetry",
+            node_id,
+            lambda iface, dest: iface.sendTelemetry(destinationId=dest, wantResponse=True),
+            timeout,
+        )
+
+    async def request_position(self, node_id: str, timeout: float = 45.0) -> dict[str, Any]:
+        """Ask a node for its current position."""
+        return await self._solicit(
+            "position",
+            node_id,
+            lambda iface, dest: iface.sendPosition(destinationId=dest, wantResponse=True),
+            timeout,
+        )
+
+    async def request_traceroute(
+        self, node_id: str, hop_limit: int = 5, timeout: float = 60.0
+    ) -> dict[str, Any]:
+        """Discover the actual route to a node, with per-hop SNR."""
+        return await self._solicit(
+            "traceroute",
+            node_id,
+            lambda iface, dest: iface.sendTraceRoute(dest, hop_limit),
+            timeout,
+        )
 
     def _ack_dest_for(self, packet: dict) -> str | None:
         """Resolve the destination of the send this routing receipt answers.
