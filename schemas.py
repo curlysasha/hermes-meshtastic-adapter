@@ -279,3 +279,46 @@ MESH_TRACEROUTE_SCHEMA = {
         },
     },
 }
+
+# --- Link control -----------------------------------------------------------
+# The node accepts a limited number of TCP clients, so anyone wanting to reach
+# it from a phone or the web UI needs the gateway to let go first. Pausing does
+# that without stopping the gateway, which would drop every other platform too.
+
+MESH_PAUSE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "mesh_pause",
+        "description": (
+            "Release the radio link so another client (phone app, web UI, flasher) can "
+            "connect to the node. The rest of the gateway keeps running; only mesh access "
+            "stops. Outbound mesh messages queue until the link resumes. Prefer a timed "
+            "pause so the mesh cannot stay down by accident."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "minutes": {
+                    "type": "number",
+                    "description": (
+                        "Auto-resume after this many minutes (max 720). Omit to pause "
+                        "until mesh_resume is called explicitly."
+                    ),
+                }
+            },
+            "additionalProperties": False,
+        },
+    },
+}
+
+MESH_RESUME_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "mesh_resume",
+        "description": (
+            "Reconnect to the node after mesh_pause. Reconnection takes about a second; "
+            "queued outbound messages are then delivered."
+        ),
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+}

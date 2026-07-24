@@ -65,6 +65,8 @@ handle_mesh_telemetry_history = meshtastic_tools.handle_mesh_telemetry_history
 handle_mesh_request_telemetry = meshtastic_tools.handle_mesh_request_telemetry
 handle_mesh_request_position = meshtastic_tools.handle_mesh_request_position
 handle_mesh_traceroute = meshtastic_tools.handle_mesh_traceroute
+handle_mesh_pause = meshtastic_tools.handle_mesh_pause
+handle_mesh_resume = meshtastic_tools.handle_mesh_resume
 
 
 def _backdate_signal(node_id: str, when: float) -> None:
@@ -1823,6 +1825,84 @@ class TestMeshtasticPlatform(unittest.IsolatedAsyncioTestCase):
         result = json.loads(await handle_mesh_telemetry({"node_id": "!cc001122"}))
         self.assertEqual(result["battery_level"], 77)
         self.assertEqual(result["temperature"], 19.5)
+
+    async def test_pause_releases_the_interface_and_resume_reconnects(self):
+        """Pausing frees the node; resuming brings the link back on its own."""
+        self.assertTrue(self.adapter.get_interfaces())
+
+        res = json.loads(await handle_mesh_pause({}))
+        self.assertTrue(res["paused"])
+        self.assertIsNone(res["resumes_at"])  # open-ended pause
+        # The reconnect loop closes the interface on its next tick.
+        for _ in range(40):
+            if not self.adapter.get_interfaces():
+                break
+            await asyncio.sleep(0.1)
+        self.assertFalse(self.adapter.get_interfaces())
+
+        res = json.loads(await handle_mesh_resume({}))
+        self.assertFalse(res["paused"])
+        for _ in range(40):
+            if self.adapter.get_interfaces():
+                break
+            await asyncio.sleep(0.1)
+        self.assertTrue(self.adapter.get_interfaces())
+
+    async def test_paused_tools_say_so_instead_of_looking_empty(self):
+        """A pause must not read as 'the mesh is gone' — that invites false diagnosis."""
+        await handle_mesh_pause({})
+        try:
+            listed = json.loads(await handle_mesh_list_nodes({}))
+            self.assertTrue(listed["paused"])
+            self.assertEqual(listed["nodes"], [])
+            self.assertIn("paused", listed["note"])
+
+            info = json.loads(await handle_mesh_node_info({"node_id": "!ab12cd34"}))
+            self.assertTrue(info["paused"])  # not "node not found"
+            self.assertNotIn("error", info)
+        finally:
+            await handle_mesh_resume({})
+
+    async def test_timed_pause_auto_resumes(self):
+        """A timed pause expires on its own, so the mesh can't stay down by accident."""
+        res = json.loads(await handle_mesh_pause({"minutes": 30}))
+        self.assertTrue(res["paused"])
+        self.assertIsNotNone(res["resumes_at"])
+        self.assertAlmostEqual(res["resumes_in_minutes"], 30, delta=1)
+
+        # Wind the deadline back; the reconnect loop notices and resumes.
+        self.adapter._pause_until = time.time() - 1
+        for _ in range(40):
+            if not self.adapter._paused:
+                break
+            await asyncio.sleep(0.1)
+        self.assertFalse(self.adapter._paused)
+
+    async def test_pause_rejects_nonsense_and_caps_duration(self):
+        """Bad durations error out; an absurd one clamps rather than pausing for a week."""
+        res = json.loads(await handle_mesh_pause({"minutes": "later"}))
+        self.assertIn("error", res)
+        res = json.loads(await handle_mesh_pause({"minutes": 0}))
+        self.assertIn("error", res)
+        self.assertFalse(self.adapter._paused)  # neither attempt took effect
+
+        res = json.loads(await handle_mesh_pause({"minutes": 99999}))
+        try:
+            self.assertLessEqual(res["resumes_in_minutes"], meshtastic_tools.PAUSE_MAX_MINUTES)
+        finally:
+            await handle_mesh_resume({})
+
+    async def test_pause_abandons_in_flight_requests(self):
+        """A request waiting on a reply is failed at once, not left to time out."""
+        pending = asyncio.create_task(self.adapter.request_position("!ab12cd34", timeout=30))
+        await asyncio.sleep(0.1)  # let it arm its waiter
+        await handle_mesh_pause({})
+        try:
+            result = await asyncio.wait_for(pending, timeout=5)
+            self.assertFalse(result["ok"])
+            self.assertIn("radio link", result["error"])
+        finally:
+            await handle_mesh_resume({})
 
     async def test_history_window_selects_by_time_not_row_count(self):
         """since_hours asks for a period; rows outside it are excluded."""

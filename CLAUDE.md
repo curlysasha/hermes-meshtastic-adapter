@@ -137,6 +137,18 @@ The outbound queue (`_outbound_queue`) is **in-memory only**, bounded at 100, ol
 
 **Drops are classified in the log.** `_note_link_drop` timestamps the outage and `_report_link_recovery` reports it on reconnect, splitting **socket resets** (back within `SOCKET_RESET_MAX_OUTAGE_SECS`, i.e. the node stayed up) from **node absences** (longer — reboot, WiFi drop, power loss), with running session totals. The distinction is the whole diagnosis: a handful of resets is normal for an ESP32 over WiFi, while repeated long absences are the node's own health and not something the adapter can fix. Log forensics of 2026-07-24 turned 16 apparent "drops" into 11 absences (user-initiated reboots) and 5 genuine resets — the counters exist so that analysis doesn't have to be redone by hand.
 
+### Pausing the link (handing the node to another client)
+
+A Meshtastic node accepts only a handful of TCP clients, so reaching it from the phone app, the web UI or a flasher means the gateway has to let go first. Hermes has no notion of pausing one platform — `hermes gateway` is all-or-nothing, and `BasePlatformAdapter` has no pause hook (`pause_typing_for_chat` is a Telegram typing indicator, unrelated) — so `mesh_pause` / `mesh_resume` implement it inside this plugin.
+
+`pause_link()` sets `_paused`, closes the interface and parks `_reconnect_loop`, which checks the flag both before connecting and inside the liveness poll. The process, the queues and every other platform keep running; only radio access stops. In-flight solicited requests are failed immediately via `_abandon_response_waiters` — the same path a dropped link uses — because waiting out a 45s timeout against a link that was deliberately closed is pure dead time. An agent can therefore hand over the radio itself, which it cannot do by stopping the gateway it runs in.
+
+`minutes` gives a timed pause (capped at `PAUSE_MAX_MINUTES`), auto-resumed by `_pause_expired()` polled from the reconnect loop rather than by a timer — the loop already ticks every second or two, and a timer would need cancelling correctly on resume, disconnect and re-pause. The cap and the timer exist for the same reason: "switch it off for a minute" must not silently become an overnight outage.
+
+**Tools must report a pause, not an empty mesh.** With no interface open, node queries would return nothing and `resolve_node` would answer "node not found" — indistinguishable from a dead radio, and an invitation to diagnose a problem that does not exist. `_paused_notice()` short-circuits those handlers with the pause state and resume time instead.
+
+State is in-process only: a gateway restart comes back connected. Persisting it would raise questions a flag cannot answer (what does a 30-minute pause mean if the gateway was down for an hour?).
+
 ### Cron / standalone delivery
 
 `_standalone_send` (wired via `cron_deliver_env_var="MESHTASTIC_HOME_CHANNEL"`) spins up a **short-lived** adapter connection with `allow_queueing=False` so cron failures surface. It does not reuse the live gateway adapter.

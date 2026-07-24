@@ -20,8 +20,10 @@ try:
     from .schemas import (
         MESH_LIST_NODES_SCHEMA,
         MESH_NODE_INFO_SCHEMA,
+        MESH_PAUSE_SCHEMA,
         MESH_REQUEST_POSITION_SCHEMA,
         MESH_REQUEST_TELEMETRY_SCHEMA,
+        MESH_RESUME_SCHEMA,
         MESH_SEND_BROADCAST_SCHEMA,
         MESH_SEND_DM_SCHEMA,
         MESH_SIGNAL_QUALITY_SCHEMA,
@@ -33,8 +35,10 @@ except ImportError:
     from schemas import (
         MESH_LIST_NODES_SCHEMA,
         MESH_NODE_INFO_SCHEMA,
+        MESH_PAUSE_SCHEMA,
         MESH_REQUEST_POSITION_SCHEMA,
         MESH_REQUEST_TELEMETRY_SCHEMA,
+        MESH_RESUME_SCHEMA,
         MESH_SEND_BROADCAST_SCHEMA,
         MESH_SEND_DM_SCHEMA,
         MESH_SIGNAL_QUALITY_SCHEMA,
@@ -46,8 +50,10 @@ except ImportError:
 __all__ = [
     "MESH_LIST_NODES_SCHEMA",
     "MESH_NODE_INFO_SCHEMA",
+    "MESH_PAUSE_SCHEMA",
     "MESH_REQUEST_POSITION_SCHEMA",
     "MESH_REQUEST_TELEMETRY_SCHEMA",
+    "MESH_RESUME_SCHEMA",
     "MESH_SEND_BROADCAST_SCHEMA",
     "MESH_SEND_DM_SCHEMA",
     "MESH_SIGNAL_QUALITY_SCHEMA",
@@ -57,8 +63,10 @@ __all__ = [
     "set_adapter",
     "handle_mesh_list_nodes",
     "handle_mesh_node_info",
+    "handle_mesh_pause",
     "handle_mesh_request_position",
     "handle_mesh_request_telemetry",
+    "handle_mesh_resume",
     "handle_mesh_send_broadcast",
     "handle_mesh_send_dm",
     "handle_mesh_signal_quality",
@@ -87,6 +95,12 @@ POSITION_STALE_AFTER_SECS = 6 * 3600
 # here logs ~53 positions a day, so 500 rows is still well over a week.
 HISTORY_MAX_WINDOW_HOURS = 30 * 24
 HISTORY_WINDOW_ROW_CAP = 500
+
+# Upper bound on a timed pause. Longer than this and "pause" is really "turn it
+# off", which should be a deliberate config change rather than a request the
+# agent can grant — an unattended mesh that quietly stays down for a day is the
+# failure this cap exists to prevent.
+PAUSE_MAX_MINUTES = 12 * 60
 
 
 def set_adapter(adapter: Any) -> None:
@@ -277,11 +291,73 @@ def _link_facts(
     }
 
 
+def _paused_notice(adapter_inst: Any) -> dict[str, Any] | None:
+    """Report a deliberate pause rather than letting it look like a dead mesh.
+
+    While paused there are no interfaces, so every node query would come back
+    empty — indistinguishable from "the radio died" and an invitation to go
+    diagnose a problem that does not exist.
+    """
+    state = adapter_inst.pause_state() if hasattr(adapter_inst, "pause_state") else None
+    if not state or not state.get("paused"):
+        return None
+    return {
+        **state,
+        "note": (
+            "The radio link is intentionally paused, so no live mesh data is available. "
+            "Call mesh_resume to reconnect."
+        ),
+    }
+
+
+async def handle_mesh_pause(args: dict, **kwargs) -> str:
+    """Release the node so something else can connect to it."""
+    adapter_inst = _get_adapter()
+    if not adapter_inst:
+        return json.dumps({"error": "Meshtastic platform adapter is not connected or active."})
+
+    minutes = args.get("minutes")
+    if minutes is not None:
+        try:
+            minutes = float(minutes)
+        except (TypeError, ValueError):
+            return json.dumps({"error": "Parameter 'minutes' must be a number."})
+        if minutes <= 0:
+            return json.dumps({"error": "Parameter 'minutes' must be positive."})
+        minutes = min(minutes, PAUSE_MAX_MINUTES)
+
+    state = adapter_inst.pause_link(minutes)
+    return json.dumps(
+        {
+            **state,
+            "note": (
+                "Radio released — the node is free for another client. Outbound messages "
+                "queue until the link resumes."
+            ),
+        },
+        indent=2,
+    )
+
+
+async def handle_mesh_resume(args: dict, **kwargs) -> str:
+    """Reconnect to the node after a pause."""
+    adapter_inst = _get_adapter()
+    if not adapter_inst:
+        return json.dumps({"error": "Meshtastic platform adapter is not connected or active."})
+
+    state = adapter_inst.resume_link()
+    return json.dumps({**state, "note": "Reconnecting to the node; it takes a second."}, indent=2)
+
+
 async def handle_mesh_list_nodes(args: dict, **kwargs) -> str:
     """Get a formatted list of all visible Meshtastic nodes in the mesh."""
     adapter_inst = _get_adapter()
     if not adapter_inst:
         return json.dumps({"error": "Meshtastic platform adapter is not connected or active."})
+
+    paused = _paused_notice(adapter_inst)
+    if paused:
+        return json.dumps({**paused, "nodes": []}, indent=2)
 
     results = []
     interfaces = adapter_inst.get_interfaces()
@@ -344,6 +420,10 @@ async def handle_mesh_node_info(args: dict, **kwargs) -> str:
     adapter_inst = _get_adapter()
     if not adapter_inst:
         return json.dumps({"error": "Meshtastic platform adapter is not connected or active."})
+
+    paused = _paused_notice(adapter_inst)
+    if paused:
+        return json.dumps(paused, indent=2)
 
     iface, info = resolve_node(node_id_query, adapter_inst)
     if not info:
@@ -411,6 +491,10 @@ async def handle_mesh_signal_quality(args: dict, **kwargs) -> str:
     adapter_inst = _get_adapter()
     if not adapter_inst:
         return json.dumps({"error": "Meshtastic platform adapter is not connected."})
+
+    paused = _paused_notice(adapter_inst)
+    if paused:
+        return json.dumps(paused, indent=2)
 
     _, info = resolve_node(node_id_query, adapter_inst)
     node_id = info.get("user", {}).get("id") if info else node_id_query
@@ -545,6 +629,10 @@ async def handle_mesh_telemetry(args: dict, **kwargs) -> str:
     adapter_inst = _get_adapter()
     if not adapter_inst:
         return json.dumps({"error": "Meshtastic platform adapter is not connected."})
+
+    paused = _paused_notice(adapter_inst)
+    if paused:
+        return json.dumps(paused, indent=2)
 
     _, info = resolve_node(node_id_query, adapter_inst)
     node_id = info.get("user", {}).get("id") if info else node_id_query
