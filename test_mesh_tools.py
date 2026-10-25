@@ -481,6 +481,22 @@ class TestMeshToolsHandlers(unittest.IsolatedAsyncioTestCase):
         # The library's own node DB is left untouched.
         self.assertIn("raw", node["user"])
 
+    async def test_node_info_omits_last_received_packet(self) -> None:
+        # The library stores the node's last packet as lastReceived; for a
+        # text message its decoded.text is the plaintext the allowlist would
+        # have dropped, so it must not come back through raw_info.
+        node = _make_node("!aaaa1111", "Alpha", "ALPH")
+        node["lastReceived"] = {
+            "from": 0xAAAA1111,
+            "decoded": {"portnum": "TEXT_MESSAGE_APP", "text": "secret body"},
+        }
+        self._install_nodes(_make_iface({"!aaaa1111": node}))
+
+        payload = json.loads(await meshtastic_tools.handle_mesh_node_info({"node_id": "!aaaa1111"}))
+        self.assertNotIn("lastReceived", payload["raw_info"])
+        self.assertNotIn("secret body", json.dumps(payload))
+        self.assertIn("lastReceived", node)
+
     async def test_node_info_firmware_unknown_before_metadata_arrives(self) -> None:
         iface = _make_iface({"!aaaa1111": _make_node("!aaaa1111", "Alpha", "ALPH")})
         iface.metadata = None

@@ -305,7 +305,9 @@ async def handle_mesh_node_info(args: dict, **kwargs) -> str:
         ),
         "last_heard_epoch": last_heard,
         "has_public_key": has_public_key,
-        "raw_info": json_safe(info),
+        # lastReceived is the node's last whole packet; for a text message it
+        # carries the plaintext body, recorded before the allowlist runs.
+        "raw_info": json_safe({k: v for k, v in info.items() if k != "lastReceived"}),
     }
 
     return json.dumps(details, indent=2)
